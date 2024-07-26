@@ -1,0 +1,437 @@
+From 330bc0adccc410dbc3fbb95d44266474e2ef9372 Mon Sep 17 00:00:00 2001
+From: Sam Meluch <sammeluch@microsoft.com>
+Date: Tue, 30 Apr 2024 13:56:44 -0700
+Subject: [PATCH] patch in timebounded install prototype
+
+---
+ solv/includes.h |   7 +-
+ solv/tdnfrepo.c | 344 +++++++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 349 insertions(+), 2 deletions(-)
+
+diff --git a/solv/includes.h b/solv/includes.h
+index 2ab0c5c..e132dd6 100644
+--- a/solv/includes.h
++++ b/solv/includes.h
+@@ -10,7 +10,6 @@
+ #include <unistd.h>
+ #include <stdbool.h>
+ #include <sys/types.h>
+-#include <sys/stat.h>
+ #include <dirent.h>
+ 
+ // libsolv
+@@ -44,4 +43,10 @@
+ #include "../history/history.h"
+ #include "prototypes.h"
+ 
++#include <expat.h>
++#include <stdlib.h>
++#include <time.h>
++#include <string.h>
++#include <zlib.h>
++
+ #endif /* __SOLV_INCLUDES_H__ */
+diff --git a/solv/tdnfrepo.c b/solv/tdnfrepo.c
+index 586059b..a8a3410 100644
+--- a/solv/tdnfrepo.c
++++ b/solv/tdnfrepo.c
+@@ -9,6 +9,323 @@
+ 
+ #include "includes.h"
+ 
++// #### XML FILTER CODE ####
++typedef struct {
++    // frequently changed values
++    char * elementBuffer;
++    int bufferLen;
++    int inPackage;
++    int printPackage;
++    int timeFound;
++
++    // managed values
++    int bufferMaxLen;
++    int depth;
++    int prevElement;
++
++    //set and forget on creation
++    time_t searchTime;
++    FILE * outfile;
++} TDNFFilterData;
++
++char * descEscapeCharLinter(char * desc) {
++    char * amp = "&amp;";
++    char * gt = "&gt;";
++    char * lt = "&lt;";
++    char * quot = "&quot;";
++    char * apos = "&apos;";
++
++    int descLen = strlen(desc) * sizeof(char) + 1;
++    char * lintedDesc = malloc(descLen);
++    bzero(lintedDesc, descLen);
++    int offset = 0;
++    int lintedSize = descLen;
++
++    for (int i = 0; i < descLen; i++) {
++        char * toAdd = NULL;
++        switch (desc[i]) {
++            case '&':
++                toAdd = amp;
++                break;
++            case '>':
++                toAdd = gt;
++                break;
++
++            case '<':
++                toAdd = lt;
++                break;
++
++            case '"':
++                toAdd = quot;
++                break;
++
++            case '\'':
++                toAdd = apos;
++                break;
++        }
++        if (toAdd == NULL) {
++            while ((i+offset)*sizeof(char) >= lintedSize) {
++                //resize
++                lintedDesc = realloc(lintedDesc, 2 * lintedSize);
++                bzero(lintedDesc+lintedSize, lintedSize); //zero memory in rest of buffer
++                lintedSize *= 2;
++            }
++            lintedDesc[i + offset] = desc[i];
++        } else {
++            while ((i+offset+strlen(toAdd))*sizeof(char) >= lintedSize) {
++                //resize
++                lintedDesc = realloc(lintedDesc, 2 * lintedSize);
++                bzero(lintedDesc+lintedSize, lintedSize); //zero memory in rest of buffer
++                lintedSize *= 2;
++            }
++            strcat(lintedDesc, toAdd);
++            offset += strlen(toAdd);
++        }
++    }
++    return lintedDesc;
++}
++
++void checkAndResizeBuffer(TDNFFilterData* tracking, int lengthToAdd) {
++    if (tracking->bufferLen + lengthToAdd >= tracking->bufferMaxLen) {
++        tracking->bufferMaxLen *= 2;
++        tracking->elementBuffer = realloc(tracking->elementBuffer, tracking->bufferMaxLen);
++    }
++}
++
++int addElementStartToBuffer(char* buff, const char * name, const char ** attrs) {
++    int ret = sprintf(buff, "<%s", name);
++    for (int i = 0; attrs[i]; i += 2) {
++        char * tempAttrVal = descEscapeCharLinter((char *)attrs[i+1]);
++        ret += sprintf(buff + ret, " %s=\"%s\"", attrs[i], tempAttrVal);
++        free(tempAttrVal);
++    }
++    ret += sprintf(buff + ret, ">");
++
++    return ret;
++}
++
++int addElementEndToBuffer(char* buff, const char * name) {
++    int ret = sprintf(buff, "</%s>", name);
++    return ret;
++}
++
++void printElementStartToFile(FILE* outfile, const char * name, const char ** attrs) {
++    char buff[5000];
++
++    addElementStartToBuffer(buff, name, attrs);
++    fprintf(outfile, "%s", buff);
++}
++
++void printElementEndToFile(FILE* outfile, const char * name) {
++    char buff[5000];
++
++    addElementEndToBuffer(buff, name);
++    fprintf(outfile, "%s", buff);
++}
++
++void TDNFFilterStartElement(void *userData, const char * name, const char ** attrs) {
++    // load tracking data
++    TDNFFilterData * tracking = (TDNFFilterData *)userData;
++    int addNewLineAfterStart = tracking->prevElement == 0;
++    char newLineBuffer[5000];
++    if (addNewLineAfterStart) {
++        sprintf(newLineBuffer, "\n");
++    } else {
++        bzero(newLineBuffer, 5000); //don't assume memory zero'd
++    }
++
++    // increment depth
++    tracking->depth += 1;
++    tracking->prevElement = 0;
++
++    if (strcmp(name, "package") == 0 || tracking->inPackage) { //new package to parse or currently parsing package info
++        tracking->inPackage = 1;
++
++        // already found/checked time
++        if (tracking->timeFound && tracking->printPackage) {
++            fprintf(tracking->outfile, "%s", newLineBuffer);
++            printElementStartToFile(tracking->outfile, name, attrs);
++        } else { // still checking for time
++            if (strcmp(name, "time") == 0) {
++                // validate file epoch time
++                for (int i = 0; attrs[i]; i += 2){
++                    if (strcmp(attrs[i], "file") == 0) {
++                        long fileTime = atoi(attrs[i+1]);
++                        tracking->printPackage = (fileTime <= tracking->searchTime);
++                        tracking->timeFound = 1;
++                    }
++                }
++                if (tracking->printPackage) {
++                    // print buffer when time is found
++                    fprintf(tracking->outfile, "%s", tracking->elementBuffer);
++                    fprintf(tracking->outfile, "%s", newLineBuffer);
++
++                    // print time element
++                    printElementStartToFile(tracking->outfile, name, attrs);
++                }
++            } else if (!tracking->timeFound) {
++                // add to buffer
++                char tempBuffer[5000];
++                int tempLen = addElementStartToBuffer(tempBuffer, name, attrs);
++                strcat(tempBuffer, newLineBuffer);
++                tempLen += strlen(newLineBuffer); //+1 if newLine character present
++
++                checkAndResizeBuffer(tracking, tempLen);
++                strcat(tracking->elementBuffer, tempBuffer);
++            }
++        }
++    } else { // not in a package or parsing a new package
++        fprintf(tracking->outfile, "%s", newLineBuffer);
++        // output line
++        printElementStartToFile(tracking->outfile, name, attrs);
++    }
++}
++
++void TDNFFilterEndElement(void * userData, const char * name) {
++    // load tracking data
++    TDNFFilterData * tracking = (TDNFFilterData *)userData;
++
++    // decrement depth
++    tracking->depth -= 1;
++    tracking->prevElement = 2;
++
++    if (!tracking->inPackage || tracking->printPackage) {
++        // print end element to file
++        printElementEndToFile(tracking->outfile, name);
++
++    } else if (tracking->inPackage && !tracking->timeFound) {
++        char tempBuffer[5000];
++        // add end element to buffer
++        int tempLen = addElementEndToBuffer(tempBuffer, name);
++
++        checkAndResizeBuffer(tracking, tempLen);
++        strcat(tracking->elementBuffer, tempBuffer);
++
++    } // else do nothing
++
++    if (strcmp(name, "package") == 0) { // on end package, reset tracking function
++        // reset userData
++        tracking->bufferLen = 0;
++        bzero(tracking->elementBuffer, tracking->bufferMaxLen);
++        tracking->inPackage = 0;
++        tracking->printPackage = 0;
++        tracking->timeFound = 0;
++    }
++
++}
++
++void TDNFFilterCharDataHandler(void * userData, const char * content, int length) {
++    // load tracking data
++    TDNFFilterData * tracking = (TDNFFilterData *)userData;
++    tracking->prevElement = 1;
++
++    char * tempBuff = malloc((length + 1) * sizeof(char));
++    bzero(tempBuff, (length + 1) * sizeof(char));
++    strncpy(tempBuff, content, length);
++    char * tempTempBuff = descEscapeCharLinter(tempBuff);
++    free(tempBuff);
++    tempBuff = tempTempBuff;
++
++    // check params 
++    if (!tracking->inPackage || tracking->printPackage) {
++        // print to file
++        fprintf(tracking->outfile, "%s", tempBuff);
++
++    } else if (tracking->inPackage && !tracking->timeFound) {
++        // add to buffer
++        checkAndResizeBuffer(tracking, length);
++        strcat(tracking->elementBuffer, tempBuff);
++
++    } // else do nothing (skipped package)
++
++    free(tempBuff);
++}
++
++char * TDNFFilterFile(const char * inFilePath, time_t epochTime) {
++    // vars
++    TDNFFilterData * data;
++    gzFile inFile;
++    FILE * outFile;
++    XML_Parser parser;
++    struct tm filterDate = {0};
++    bzero(&filterDate, sizeof(struct tm));
++    //time_t epochFilterTime;
++    char timeBuff[1000];
++    char * outFilePath;
++
++    sprintf(timeBuff, "-%ld.xml", epochTime);
++    int outFileLen = strlen(inFilePath) + strlen(timeBuff);
++
++    outFilePath = malloc(outFileLen * sizeof(char));
++    bzero(outFilePath, outFileLen * sizeof(char));
++
++    strncpy(outFilePath, inFilePath, strlen(inFilePath) - 7); //remove extension to be added with the name
++    strcat(outFilePath, timeBuff);
++
++
++    // init vars, load files
++    inFile = gzopen(inFilePath, "r");
++    outFile = fopen(outFilePath, "w");
++
++    data = (TDNFFilterData *) malloc(sizeof(TDNFFilterData));
++    data->bufferMaxLen = 5000;
++    data->elementBuffer = (char *)malloc(data->bufferMaxLen * sizeof(char));
++    bzero(data->elementBuffer, data->bufferMaxLen);
++    data->outfile = outFile;
++    data->searchTime = epochTime;
++    data->depth = 0;
++    data->bufferLen = 0;
++    data->inPackage = 0;
++    data->printPackage = 0;
++    data->timeFound = 0;
++
++    //create parser
++    parser = XML_ParserCreate(NULL);
++
++    XML_SetUserData(parser, data);
++    XML_SetElementHandler(parser, TDNFFilterStartElement, TDNFFilterEndElement);
++    XML_SetCharacterDataHandler(parser, TDNFFilterCharDataHandler);
++
++    //parse XML
++
++    fprintf(outFile, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
++    int done;
++    do {
++        void * buf = XML_GetBuffer(parser, BUFSIZ);
++        if (! buf) {
++            // TODO: convert to TDNF_BAIL_ON_ERROR
++            fprintf(stderr, "Couldn't allocate memory for buffer\n");
++            XML_ParserFree(parser);
++            return NULL;
++        }
++
++        const size_t len = gzread(inFile, buf, BUFSIZ - 1);
++        ((char *)buf)[len] = '\0';
++
++        done = gzeof(inFile);
++
++        if (XML_ParseBuffer(parser, (int)len, done) == XML_STATUS_ERROR) {
++            // TODO: convert to TDNF_BAIL_ON_ERROR
++            fprintf(stderr,
++                "Parse error at line %lu:\n%s\n",
++                XML_GetCurrentLineNumber(parser),
++                XML_ErrorString(XML_GetErrorCode(parser)));
++            XML_ParserFree(parser);
++            return NULL;
++        }
++    } while (!done);
++
++    // TODO: create cleanup and error tags for BAIL and formatting
++    free(data->elementBuffer);
++    free(data);
++    XML_ParserFree(parser);
++    fclose(outFile);
++    gzclose(inFile);
++
++    return outFilePath;
++}
++// #### END XML FILTER CODE ####
++
+ uint32_t
+ SolvLoadRepomd(
+     Repo* pRepo,
+@@ -53,20 +370,37 @@ SolvLoadRepomdPrimary(
+ {
+     uint32_t dwError = 0;
+     FILE *fp = NULL;
++    // new vars for Filter
++    int useTempRepo = 1; // hardcoded to true for now. Add as config option
++    char * primaryRepo = (char *) pszPrimary;
++    char * tempRepoFile = NULL;
++    // end new vars
++
+     if( !pRepo || IsNullOrEmptyString(pszPrimary))
+     {
+         dwError = ERROR_TDNF_INVALID_PARAMETER;
+         BAIL_ON_TDNF_LIBSOLV_ERROR(dwError);
+     }
+ 
+-    fp = solv_xfopen(pszPrimary, "r");
++    // POC filter code added
++    if (useTempRepo){
++        tempRepoFile = TDNFFilterFile(pszPrimary, 1704096000); // hardcoded magic number (jan 1 2024 epoch time)
++        primaryRepo = tempRepoFile;
++    }
++    //end sam's filter code
++
++    // modified to use new primaryRepo, defaults to pszPrimary when not filtering
++    fp = solv_xfopen(primaryRepo, "r");
+     if (fp == NULL)
+     {
++        printf("fp null\n");
++
+         dwError = ERROR_TDNF_SOLV_IO;
+         BAIL_ON_TDNF_LIBSOLV_ERROR(dwError);
+     }
+     if (repo_add_rpmmd(pRepo, fp, 0, 0))
+     {
++        printf("repoadd error\n");
+         dwError = ERROR_TDNF_SOLV_IO;
+         BAIL_ON_TDNF_LIBSOLV_ERROR(dwError);
+     }
+@@ -75,6 +409,11 @@ cleanup:
+     {
+         fclose(fp);
+     }
++    if(tempRepoFile != NULL)
++    {
++        //remove(tempRepoFile);
++        free(tempRepoFile);
++    }
+     return dwError;
+ 
+ error:
+@@ -211,11 +550,13 @@ SolvReadYumRepo(
+ 
+     dwError = SolvLoadRepomdPrimary(pRepo, pszPrimary);
+     BAIL_ON_TDNF_LIBSOLV_ERROR(dwError);
++    printf("loaded primary\n");
+ 
+     if(pszFilelists)
+     {
+         dwError = SolvLoadRepomdFilelists(pRepo, pszFilelists);
+         BAIL_ON_TDNF_LIBSOLV_ERROR(dwError);
++        printf("loaded filelists\n");
+     }
+ 
+     if(pszUpdateinfo)
+@@ -228,6 +569,7 @@ SolvReadYumRepo(
+     {
+         dwError = SolvLoadRepomdOther(pRepo, pszOther);
+         BAIL_ON_TDNF_LIBSOLV_ERROR(dwError);
++        printf("loaded other\n");
+     }
+ 
+ 
+-- 
+2.34.1
+
