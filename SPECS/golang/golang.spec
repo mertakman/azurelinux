@@ -1,7 +1,7 @@
 %global goroot          %{_libdir}/golang
 %global gopath          %{_datadir}/gocode
-%global ms_go_filename  go1.22.5-20240702.3.src.tar.gz
-%global ms_go_revision  1
+%global ms_go_filename  go1.22.5-20240722.5.src.tar.gz
+%global ms_go_revision  2
 %ifarch aarch64
 %global gohostarch      arm64
 %else
@@ -15,7 +15,7 @@
 Summary:        Go
 Name:           golang
 Version:        1.22.5
-Release:        1%{?dist}
+Release:        2%{?dist}
 License:        BSD-3-Clause
 Vendor:         Microsoft Corporation
 Distribution:   Azure Linux
