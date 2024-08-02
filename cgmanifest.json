@@ -4577,12 +4577,12 @@
     },
     {
       "component": {
-        "type": "other",
         "other": {
+          "downloadUrl": "https://github.com/microsoft/go/releases/download/v1.22.5-2/go1.22.5-20240722.5.src.tar.gz",
           "name": "golang",
-          "version": "1.22.5",
-          "downloadUrl": "https://github.com/microsoft/go/releases/download/v1.22.5-1/go1.22.5-20240702.3.src.tar.gz"
-        }
+          "version": "1.22.5"
+        },
+        "type": "other"
       }
     },
     {
@@ -9092,7 +9092,7 @@
         "other": {
           "name": "libecb",
           "version": "9.30",
-          "downloadUrl": "http://cvs.schmorp.de/libecb/?view=tar&pathrev=rxvt-unicode-rel-9_30"
+          "downloadUrl": "http://cvs.schmorp.de/libecb/?view=tar\u0026pathrev=rxvt-unicode-rel-9_30"
         }
       }
     },
@@ -30707,3 +30707,4 @@
   ],
   "Version": 1
 }
+
